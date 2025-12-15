@@ -9,7 +9,7 @@ import math
 # 1. 核心邏輯區
 # ==========================================
 SYSTEM_VERSION = "v5.3 (Fixed Offline Scheduling)"
-OFFLINE_KEYWORDS = ["熔接", "雷射", "PT", "超音波", "CAX", "壓檢"]
+OFFLINE_KEYWORDS = ["熔接", "雷射", "PT", "超音波熔接", "CAX", "壓檢", "AS"]
 
 def get_base_model(product_id):
     if pd.isna(product_id): return ""
@@ -500,3 +500,4 @@ if uploaded_file is not None:
 
 else:
     st.info("👈 請從左側開始設定參數，再上傳檔案。")
+
