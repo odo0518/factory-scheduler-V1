@@ -8,7 +8,7 @@ import math
 # ==========================================
 # 1. 核心邏輯區
 # ==========================================
-SYSTEM_VERSION = "v5.2 (Custom Line Hours)"
+SYSTEM_VERSION = "v5.3 (Fixed Offline Scheduling)"
 OFFLINE_KEYWORDS = ["熔接", "雷射", "PT", "超音波", "CAX", "壓檢"]
 
 def get_base_model(product_id):
@@ -188,7 +188,7 @@ def load_and_clean_data(uploaded_file):
     except Exception as e:
         return None, str(e)
 
-# 修改後的排程核心：接收 line_settings 參數
+# 修改後的排程核心
 def run_scheduler(df, total_manpower, total_lines, changeover_mins, line_settings):
     MAX_MINUTES = 14 * 24 * 60 
     
@@ -335,6 +335,62 @@ def run_scheduler(df, total_manpower, total_lines, changeover_mins, line_setting
                     })
                 else:
                     results.append({'工單': row['Order_ID'], '狀態': '失敗(資源不足)', '產線': f"Line {target_line_idx+1}"})
+
+    # --- Phase 2: 線外工單 (Offline) ---
+    # 補上這段邏輯
+    df_offline = df[df['Is_Offline'] == True].copy()
+    
+    # 這裡使用第一條產線的時間表作為工廠開放時間基準
+    curr_mask = offline_mask
+    curr_cumsum = offline_cumsum
+
+    for _, row in df_offline.iterrows():
+        manpower = int(row['Manpower_Req'])
+        total_man_minutes = float(row['Total_Man_Minutes'])
+        prod_duration = int(np.ceil(total_man_minutes / manpower)) if manpower > 0 else 0
+        
+        if manpower > total_manpower:
+             results.append({'工單': row['Order_ID'], '狀態': '失敗(人力不足)', '產線': '線外專區'})
+             continue
+
+        found = False
+        t_search = 480 
+        best_start, best_end = -1, -1
+
+        while not found and t_search < MAX_MINUTES - prod_duration:
+            if not curr_mask[t_search]:
+                t_search += 1
+                continue
+            
+            s_val = curr_cumsum[t_search]
+            t_val = s_val + prod_duration
+            if t_val > curr_cumsum[-1]: break
+            t_end = np.searchsorted(curr_cumsum, t_val)
+            
+            i_mask = curr_mask[t_search:t_end]
+            current_max_used = np.max(timeline_manpower[t_search:t_end][i_mask]) if np.any(i_mask) else 0
+            
+            if current_max_used + manpower <= total_manpower:
+                best_start = t_search
+                best_end = t_end
+                found = True
+            else:
+                t_search += 5 
+        
+        if found:
+            mask_slice = curr_mask[best_start:best_end]
+            timeline_manpower[best_start:best_end][mask_slice] += manpower
+            
+            results.append({
+                '產線': '線外專區', 
+                '工單': row['Order_ID'], '產品': row['Product_ID'], '備註': row['Remarks'],
+                '數量': row['Qty'], '類別': '線外', '換線(分)': 0,
+                '需求人力': manpower, '預計開始': format_time_str(best_start),
+                '完工時間': format_time_str(best_end), '線佔用(分)': prod_duration, '狀態': 'OK', '排序用': best_end
+            })
+        else:
+             results.append({'工單': row['Order_ID'], '狀態': '失敗(找不到空檔)', '產線': '線外專區'})
+
 
     if results:
         last_time = max([r['排序用'] for r in results if r.get('狀態')=='OK'], default=0)
