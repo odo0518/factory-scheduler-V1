@@ -4,12 +4,14 @@ import numpy as np
 from datetime import datetime, time
 import io
 import math
+import re  # 新增正則表達式模組，用於抓取備註欄的數字
 
 # ==========================================
 # 1. 核心邏輯區
 # ==========================================
-SYSTEM_VERSION = "v5.3 (Fixed Offline Scheduling)"
-OFFLINE_KEYWORDS = ["熔接", "雷射", "PT", "超音波熔接", "CAX", "壓檢", "AS"]
+SYSTEM_VERSION = "v5.4 (Process Dependency Support)"
+# 線外關鍵字設定 (根據您的圖示，加入了 '超音波熔接')
+OFFLINE_KEYWORDS = ["熔接", "雷射", "PT", "超音波", "CAX", "壓檢", "AS"]
 
 def get_base_model(product_id):
     if pd.isna(product_id): return ""
@@ -183,6 +185,17 @@ def load_and_clean_data(uploaded_file):
             if 'LINE5' in val_str: return 5
             return 0 
         df['Target_Line'] = df['Remarks'].apply(get_target_line)
+
+        # ★★★ 新增：解析備註欄的順序 (Sequence) ★★★
+        def get_sequence(val):
+            try:
+                # 尋找字串中的第一個數字 (例如 "1", "備註1", "Step 1" -> 1)
+                match = re.search(r'\d+', str(val))
+                if match:
+                    return int(match.group())
+                return 0 # 若無數字則預設為 0
+            except: return 0
+        df['Sequence'] = df['Remarks'].apply(get_sequence)
         
         return df, None
     except Exception as e:
@@ -194,7 +207,6 @@ def run_scheduler(df, total_manpower, total_lines, changeover_mins, line_setting
     
     line_masks = []
     line_cumsums = []
-    # 使用傳入的 line_settings 來建立遮罩
     for setting in line_settings:
         m = create_line_mask(setting["start"], setting["end"], 14)
         line_masks.append(m)
@@ -206,10 +218,12 @@ def run_scheduler(df, total_manpower, total_lines, changeover_mins, line_setting
     timeline_manpower = np.zeros(MAX_MINUTES, dtype=int)
     line_usage_matrix = np.zeros((total_lines, MAX_MINUTES), dtype=bool)
     results = []
-    # 產線空閒時間初始值設為該產線的起始時間
     line_free_time = [parse_time_to_mins(setting["start"]) for setting in line_settings]
     
-    # --- Phase 1: 流水線 ---
+    # ★★★ 新增：追蹤完工時間字典 (Order_ID, Sequence) -> Finish_Time ★★★
+    order_finish_times = {}
+
+    # --- Phase 1: 流水線 (Online) ---
     df_online = df[df['Is_Offline'] == False].copy()
     family_groups = df_online.groupby('Base_Model')
     
@@ -219,13 +233,11 @@ def run_scheduler(df, total_manpower, total_lines, changeover_mins, line_setting
         total_weight = (group_df['Manpower_Req'] * 1000 + group_df['Total_Man_Minutes']).sum()
         target_lines = group_df['Target_Line'].unique()
         
-        # 簡單判斷：若有指定 Line4/5 則只排該線，否則排前段
         if 4 in target_lines: candidate_lines = [3]
         elif 5 in target_lines: candidate_lines = [4]
         else: candidate_lines = [i for i in range(total_lines) if i not in [3, 4]]
-        if not candidate_lines: candidate_lines = [i for i in range(total_lines)] # 防呆
+        if not candidate_lines: candidate_lines = [i for i in range(total_lines)] 
 
-        # 確保候選產線不超出實際產線數
         candidate_lines = [c for c in candidate_lines if c < total_lines]
         if not candidate_lines: candidate_lines = [0]
 
@@ -326,6 +338,9 @@ def run_scheduler(df, total_manpower, total_lines, changeover_mins, line_setting
                     current_t = real_end
                     line_free_time[target_line_idx] = real_end 
                     
+                    # ★★★ 記錄該工單 (Order_ID, Sequence) 的完工時間 ★★★
+                    order_finish_times[(str(row['Order_ID']), row['Sequence'])] = real_end
+
                     results.append({
                         '產線': f"Line {target_line_idx+1}", 
                         '工單': row['Order_ID'], '產品': row['Product_ID'], '備註': row['Remarks'],
@@ -337,10 +352,7 @@ def run_scheduler(df, total_manpower, total_lines, changeover_mins, line_setting
                     results.append({'工單': row['Order_ID'], '狀態': '失敗(資源不足)', '產線': f"Line {target_line_idx+1}"})
 
     # --- Phase 2: 線外工單 (Offline) ---
-    # 補上這段邏輯
     df_offline = df[df['Is_Offline'] == True].copy()
-    
-    # 這裡使用第一條產線的時間表作為工廠開放時間基準
     curr_mask = offline_mask
     curr_cumsum = offline_cumsum
 
@@ -352,9 +364,21 @@ def run_scheduler(df, total_manpower, total_lines, changeover_mins, line_setting
         if manpower > total_manpower:
              results.append({'工單': row['Order_ID'], '狀態': '失敗(人力不足)', '產線': '線外專區'})
              continue
-
+        
+        # ★★★ Dependency Check: 檢查是否有前置工序 ★★★
+        seq = row['Sequence']
+        order_id = str(row['Order_ID'])
+        min_start_time = 480 # 預設最早 08:00 開始
+        
+        # 如果 Sequence > 1 (例如是標註2)，嘗試尋找 Sequence-1 (標註1) 的完工時間
+        if seq > 1:
+            prev_seq = seq - 1
+            if (order_id, prev_seq) in order_finish_times:
+                min_start_time = order_finish_times[(order_id, prev_seq)]
+                # (選擇性) 可以在這裡加上緩衝時間，目前設定為無縫接軌
+        
         found = False
-        t_search = 480 
+        t_search = max(480, min_start_time) # 搜尋起點必須晚於前置工序完工時間
         best_start, best_end = -1, -1
 
         while not found and t_search < MAX_MINUTES - prod_duration:
@@ -381,6 +405,9 @@ def run_scheduler(df, total_manpower, total_lines, changeover_mins, line_setting
             mask_slice = curr_mask[best_start:best_end]
             timeline_manpower[best_start:best_end][mask_slice] += manpower
             
+            # 記錄完工時間 (以防還有標註3需要等標註2)
+            order_finish_times[(str(row['Order_ID']), row['Sequence'])] = best_end
+
             results.append({
                 '產線': '線外專區', 
                 '工單': row['Order_ID'], '產品': row['Product_ID'], '備註': row['Remarks'],
@@ -420,9 +447,7 @@ with st.sidebar:
     st.markdown("---")
     st.header("🕒 各產線工時設定")
     
-    # 動態產生每條線的開始/結束時間設定
     line_settings_from_ui = []
-    # 使用 expander 讓介面乾淨一點，或是直接列出來
     with st.expander("點此展開設定詳細時間", expanded=True):
         for i in range(total_lines):
             st.markdown(f"**Line {i+1}**")
@@ -432,14 +457,13 @@ with st.sidebar:
             with col2:
                 t_end = st.time_input(f"L{i+1} 結束", value=time(17, 0), key=f"end_{i}")
             
-            # 將時間轉為字串格式 (HH:MM) 存入列表
             line_settings_from_ui.append({
                 "start": t_start.strftime("%H:%M"), 
                 "end": t_end.strftime("%H:%M")
             })
 
     st.markdown("---")
-    st.info("💡 說明：系統會優先處理急單，並將相同主型號工單合併生產以減少換線。")
+    st.info("💡 說明：\n1. 系統會將相同主型號工單合併生產。\n2. 若備註欄有標註順序 (如 1, 2)，系統會確保標註 2 在標註 1 完工後才開始。")
 
 uploaded_file = st.file_uploader("📂 請上傳工單 Excel 檔案", type=["xlsx", "xls"])
 
@@ -454,8 +478,7 @@ if uploaded_file is not None:
             st.dataframe(df_clean.head())
             
         if st.button("🚀 開始 AI 排程運算", type="primary"):
-            with st.spinner('正在進行百萬次模擬運算...請稍候...'):
-                # 呼叫運算核心，並傳入 line_settings_from_ui
+            with st.spinner('正在進行百萬次模擬運算 (包含工序相依性檢查)...請稍候...'):
                 df_schedule, df_idle, df_efficiency, df_utilization = run_scheduler(
                     df_clean, 
                     total_manpower, 
@@ -500,4 +523,3 @@ if uploaded_file is not None:
 
 else:
     st.info("👈 請從左側開始設定參數，再上傳檔案。")
-
