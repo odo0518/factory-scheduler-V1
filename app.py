@@ -1,525 +1,1305 @@
 import streamlit as st
+
 import pandas as pd
+
 import numpy as np
+
 from datetime import datetime, time
+
 import io
+
 import math
-import re  # 新增正則表達式模組，用於抓取備註欄的數字
+
+import re
+
+
 
 # ==========================================
-# 1. 核心邏輯區
+
+# 1. 全域配置
+
 # ==========================================
-SYSTEM_VERSION = "v5.4 (Process Dependency Support)"
-# 線外關鍵字設定 (根據您的圖示，加入了 '超音波熔接')
-OFFLINE_KEYWORDS = ["熔接", "雷射", "PT", "超音波", "CAX", "壓檢", "AS"]
+
+SYSTEM_VERSION = "v23.1 (Fix: Multi-Gap Filling & Strict Setup Display)"
+
+
+
+# 線外資源
+
+OFFLINE_CONFIG_MAP = {
+
+    "超音波": ("線外-超音波熔接", 1), 
+
+    "LS": ("線外-組裝前LS", 2),
+
+    "雷射": ("線外-組裝前LS", 2),
+
+    "PT": ("線外-PT", 1),
+
+    "PKM": ("線外-線邊組裝", 2),
+
+    "裝配": ("線外-線邊組裝", 2),
+
+    "組裝": ("線外-線邊組裝", 2),
+
+    "AS": ("線外-線邊組裝", 2)
+
+}
+
+OFFLINE_DEFAULTS = list(OFFLINE_CONFIG_MAP.keys())
+
+
 
 def get_base_model(product_id):
+
     if pd.isna(product_id): return ""
-    s = str(product_id).strip()
-    return s.split('/')[0].strip()
+
+    s = str(product_id).strip().split('/')[0].strip()
+
+    parts = s.split('-')
+
+    if len(parts) >= 2 and parts[0].upper() == 'N':
+
+        return f"{parts[0]}-{parts[1]}"
+
+    return s
+
+
 
 def parse_time_to_mins(time_str):
+
     try:
+
         t = datetime.strptime(time_str, "%H:%M")
+
         return t.hour * 60 + t.minute
+
     except: return 480 
 
+
+
 def create_line_mask(start_str, end_str, days=14):
+
     total_minutes = days * 24 * 60
+
     mask = np.zeros(total_minutes, dtype=bool)
+
     start_min = parse_time_to_mins(start_str)
+
     end_min = parse_time_to_mins(end_str)
+
     breaks = [(600, 605), (720, 780), (900, 905), (1020, 1050)]
-    
+
     for day in range(days):
-        day_offset = day * 24 * 60
+
+        offset = day * 1440
+
         if end_min > start_min:
-            mask[day_offset + start_min : day_offset + end_min] = True
-            for b_start, b_end in breaks:
-                abs_b_start = day_offset + b_start
-                abs_b_end = day_offset + b_end
-                mask[abs_b_start : abs_b_end] = False
+
+            mask[offset + start_min : offset + end_min] = True
+
+            for b_s, b_e in breaks:
+
+                mask[offset + b_s : offset + b_e] = False
+
     return mask
 
+
+
 def format_time_str(minute_idx):
+
     d = (minute_idx // 1440) + 1
-    m_of_day = minute_idx % 1440
-    hh = m_of_day // 60
-    mm = m_of_day % 60
-    return f"D{d} {hh:02d}:{mm:02d}"
 
-def analyze_idle_manpower(timeline_manpower, work_masks, total_manpower, max_sim_minutes):
-    global_work_mask = np.zeros(max_sim_minutes, dtype=bool)
-    for m in work_masks:
-        length = min(len(m), max_sim_minutes)
-        global_work_mask[:length] |= m[:length]
+    m = minute_idx % 1440
+
+    return f"D{d} {m//60:02d}:{m%60:02d}"
+
+
+
+def extract_line_num(val):
+
+    match = re.search(r'LINE(\d+)', str(val).upper().replace(' ', ''))
+
+    return int(match.group(1)) if match else 0
+
+
+
+def get_sequence(val):
+
+    try:
+
+        match = re.search(r'(\d+)', str(val))
+
+        if match: return int(match.group(1))
+
+        return 0 
+
+    except: return 0
+
+
+
+# ==========================================
+
+# 2. 規則引擎
+
+# ==========================================
+
+class RuleEngine:
+
+    def __init__(self, df_rules):
+
+        self.rules = []          
+
+        self.fixed_lines = set() 
+
+        self.product_binding = {} 
+
+        self.parse_rules(df_rules)
+
+
+
+    def parse_rules(self, df):
+
+        if df is None: return
+
+        df.columns = df.columns.astype(str).str.replace(r'[\n\r\s]', '', regex=True)
+
         
-    idle_records = []
-    current_excess, start_time = -1, -1
-    
-    for t in range(max_sim_minutes):
-        if global_work_mask[t]:
-            used = timeline_manpower[t]
-            excess = total_manpower - used
-            if excess != current_excess:
-                if current_excess > 0 and start_time != -1:
-                    idle_records.append({
-                        '開始時間': format_time_str(start_time), '結束時間': format_time_str(t),
-                        '持續分鐘': t - start_time, '閒置(多餘)人力': current_excess
-                    })
-                current_excess, start_time = excess, t
-        else:
-            if current_excess > 0 and start_time != -1:
-                idle_records.append({
-                    '開始時間': format_time_str(start_time), '結束時間': format_time_str(t),
-                    '持續分鐘': t - start_time, '閒置(多餘)人力': current_excess
-                })
-            current_excess, start_time = -1, -1
-    return pd.DataFrame(idle_records)
 
-def calculate_daily_efficiency(timeline_manpower, line_masks, total_manpower, days_to_analyze=5):
-    std_mask = line_masks[0] 
-    efficiency_records = []
-    
-    for day in range(days_to_analyze):
-        day_start, day_end = day * 1440, (day + 1) * 1440
-        day_std_mask = std_mask[day_start:day_end]
-        standard_work_mins = np.sum(day_std_mask)
-        day_usage = timeline_manpower[day_start:day_end]
-        global_day_mask = np.zeros(1440, dtype=bool)
-        for lm in line_masks:
-            global_day_mask |= lm[day_start:day_end]
+        c_type = next((c for c in df.columns if '彈性' in c or '固定' in c), None)
+
+        c_line = next((c for c in df.columns if '線別' in c and '彈性' not in c), None)
+
+        c_prod = next((c for c in df.columns if '產品' in c), None)
+
+        c_proc = next((c for c in df.columns if '領料' in c or '製程' in c), None)
+
+
+
+        if not (c_type and c_line and c_prod): return
+
+
+
+        for _, row in df.iterrows():
+
+            l_type = str(row[c_type]).strip()
+
+            l_name = str(row[c_line]).strip()
+
+            p_pat = str(row[c_prod]).strip().replace('*', '') 
+
+            proc = str(row[c_proc]).strip() if c_proc and not pd.isna(row[c_proc]) else ""
+
             
-        utilized = np.sum(day_usage[global_day_mask])
-        total_capacity = total_manpower * standard_work_mins
-        
-        if standard_work_mins > 0:
-            suggested_manpower = math.ceil(utilized / (standard_work_mins * 0.95))
-        else:
-            suggested_manpower = 0
 
-        efficiency = (utilized / total_capacity * 100) if total_capacity > 0 else 0
-        
-        if standard_work_mins > 0:
-            diff = suggested_manpower - total_manpower
-            suggestion = f"需增加 {diff} 人" if diff > 0 else (f"可減少 {abs(diff)} 人" if diff < 0 else "人力完美")
+            l_idx = extract_line_num(l_name) - 4
+
+            if l_idx < 0: continue
+
+
+
+            if '固定' in l_type:
+
+                self.fixed_lines.add(l_idx)
+
             
-            efficiency_records.append({
-                '日期': f'D{day+1}', 
-                '當日標準工時(分)': standard_work_mins, 
-                '現有人力': total_manpower,
-                '建議人力(95%效)': suggested_manpower,
-                '調度建議': suggestion,
-                '實際產出人時': utilized,
-                '全廠效率(%)': round(efficiency, 2)
+
+            if p_pat:
+
+                if not proc or proc in ['工單發料', 'nan', '']:
+
+                    self.product_binding[p_pat] = l_idx
+
+
+
+            self.rules.append({
+
+                'line_idx': l_idx, 'pattern': p_pat, 'process': proc, 'type': l_type
+
             })
-    return pd.DataFrame(efficiency_records)
 
-def calculate_line_utilization(line_usage_matrix, line_masks, total_lines, days_to_analyze=5):
-    utilization_records = []
-    for day in range(days_to_analyze):
-        day_start = day * 1440
-        day_end = (day + 1) * 1440
-        row = {'日期': f'D{day+1}'}
-        for i in range(total_lines):
-            available_mask = line_masks[i][day_start:day_end]
-            available_mins = np.sum(available_mask)
-            busy_mask = line_usage_matrix[i][day_start:day_end]
-            valid_busy_mask = busy_mask & available_mask
-            busy_mins = np.sum(valid_busy_mask)
-            if available_mins > 0:
-                util_rate = (busy_mins / available_mins) * 100
-                row[f'Line {i+1} (%)'] = round(util_rate, 1)
-            else:
-                row[f'Line {i+1} (%)'] = "-"
-        if any(v != "-" for k, v in row.items() if k != '日期'):
-            utilization_records.append(row)
-    return pd.DataFrame(utilization_records)
+
+
+    def get_assignment(self, product_id, process_type):
+
+        for r in self.rules:
+
+            if r['process'] and r['process'] not in ['工單發料', 'nan', '']:
+
+                if r['pattern'] in str(product_id) and r['process'] in str(process_type):
+
+                    return r['line_idx']
+
+        return None
+
+
+
+    def get_product_binding(self, product_id):
+
+        for pat, l_idx in self.product_binding.items():
+
+            if pat in str(product_id): return l_idx
+
+        return None
+
+
+
+    def can_line_accept_product(self, line_idx, product_id):
+
+        # 1. 固定線潔癖 (只接白名單)
+
+        if line_idx in self.fixed_lines:
+
+            for r in self.rules:
+
+                if r['line_idx'] == line_idx and r['pattern'] in str(product_id):
+
+                    return True
+
+            return False 
+
+        
+
+        # 2. 彈性線 (不搶固定線的單，除非規則允許)
+
+        for pat, bound_line in self.product_binding.items():
+
+            if pat in str(product_id):
+
+                if line_idx != bound_line: return False
+
+        return True 
+
+
+
+# ==========================================
+
+# 3. 資料讀取
+
+# ==========================================
 
 def load_and_clean_data(uploaded_file):
+
     try:
-        df = pd.read_excel(uploaded_file)
-        df.columns = df.columns.astype(str).str.replace('\n', '').str.replace(' ', '')
+
+        xls = pd.read_excel(uploaded_file, sheet_name=None)
+
+        df_ord = next((df for k,df in xls.items() if '工單' in df.columns or '產品' in str(df.columns)), None)
+
+        df_rule = next((df for k,df in xls.items() if '線別' in str(df.columns) or '彈性' in str(df.columns)), None)
+
         
+
+        if df_ord is None: return None, None, "缺少工單資料表"
+
+        if df_rule is None: return None, None, "缺少規則資料表"
+
+        
+
+        engine = RuleEngine(df_rule)
+
+        df = df_ord.copy()
+
+        df.columns = df.columns.astype(str).str.replace(r'[\n\s]', '', regex=True)
+
         col_map = {}
-        for col in df.columns:
-            if '工單' in col: col_map['Order_ID'] = col
-            elif '產品編號' in col: col_map['Product_ID'] = col
-            elif '預定裝配' in col: col_map['Plan_Qty'] = col
-            elif '實際裝配' in col: col_map['Actual_Qty'] = col
-            elif '標準人數' in col: col_map['Manpower_Req'] = col
-            elif '工時(分)' in col or '組裝工時' in col: col_map['Total_Man_Minutes'] = col
-            elif '項次' in col: col_map['Priority'] = col
-            elif '已領料' in col: col_map['Process_Type'] = col
-            elif '備註' in col: col_map['Remarks'] = col
+
+        for c in df.columns:
+
+            if '工單' in c: col_map[c] = 'Order_ID'
+
+            elif '產品' in c: col_map[c] = 'Product_ID'
+
+            elif '預定' in c: col_map[c] = 'Qty' 
+
+            elif '人數' in c: col_map[c] = 'Manpower_Req' 
+
+            elif '工時' in c: col_map[c] = 'Total_Man_Minutes' 
+
+            elif '項次' in c: col_map[c] = 'Priority'
+
+            elif '領料' in c: col_map[c] = 'Process_Type'
+
+            elif '備註' in c: col_map[c] = 'Remarks'
+
+            elif '急單' in c: col_map[c] = 'Rush_Col'
+
+            elif '指定' in c: col_map[c] = 'Line_Col'
+
+        df = df.rename(columns=col_map)
+
+        
+
+        for c in ['Qty', 'Manpower_Req', 'Total_Man_Minutes']:
+
+            if c in df.columns:
+
+                df[c] = pd.to_numeric(df[c].astype(str).str.replace(',', ''), errors='coerce').fillna(0)
+
+            else: df[c] = 0
+
             
-        df = df.rename(columns={v: k for k, v in col_map.items()})
-        
-        if 'Total_Man_Minutes' not in df.columns: return None, "錯誤：缺少「工時(分)」欄位"
-        if 'Process_Type' not in df.columns: df['Process_Type'] = '組裝'
-        if 'Remarks' not in df.columns: df['Remarks'] = ''
-        
-        for col in ['Plan_Qty', 'Actual_Qty', 'Manpower_Req', 'Total_Man_Minutes']:
-            if col in df.columns:
-                df[col] = df[col].astype(str).str.replace(',', '').str.strip()
-                df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
-            else:
-                df[col] = 0
 
-        df['Qty'] = np.where(df['Actual_Qty'] > 0, df['Actual_Qty'], df['Plan_Qty'])
-        df = df[(df['Qty'] > 0) & (df['Manpower_Req'] > 0)]
-        
-        df['Is_Rush'] = df['Remarks'].astype(str).str.contains('急單', na=False)
+        df = df[df['Qty'] > 0]
+
         df['Base_Model'] = df['Product_ID'].apply(get_base_model)
-        
-        def check_offline(val):
-            val_str = str(val)
-            for kw in OFFLINE_KEYWORDS:
-                if kw in val_str: return True
-            return False
-        df['Is_Offline'] = df['Process_Type'].apply(check_offline)
-        
-        def get_target_line(val):
-            val_str = str(val).upper().replace(' ', '')
-            if 'LINE4' in val_str: return 4
-            if 'LINE5' in val_str: return 5
-            return 0 
-        df['Target_Line'] = df['Remarks'].apply(get_target_line)
 
-        # ★★★ 新增：解析備註欄的順序 (Sequence) ★★★
-        def get_sequence(val):
-            try:
-                # 尋找字串中的第一個數字 (例如 "1", "備註1", "Step 1" -> 1)
-                match = re.search(r'\d+', str(val))
-                if match:
-                    return int(match.group())
-                return 0 # 若無數字則預設為 0
-            except: return 0
+        
+
+        def classify_row(row):
+
+            prod = str(row['Product_ID'])
+
+            proc = str(row['Process_Type'])
+
+            assigned_line = engine.get_assignment(prod, proc)
+
+            if assigned_line is not None: return False, assigned_line + 4, "Online", 0
+
+            
+
+            is_offline_kw = False
+
+            offline_info = ("", 0)
+
+            for kw, (gname, limit) in OFFLINE_CONFIG_MAP.items():
+
+                if kw in proc:
+
+                    is_offline_kw = True
+
+                    offline_info = (gname, limit)
+
+                    break
+
+            if is_offline_kw: return True, 0, offline_info[0], offline_info[1]
+
+
+
+            orig_target = extract_line_num(row.get('Line_Col', ''))
+
+            if orig_target == 0: orig_target = extract_line_num(row.get('Remarks', ''))
+
+            if orig_target == 0:
+
+                bound_line = engine.get_product_binding(prod)
+
+                if bound_line is not None: orig_target = bound_line + 4
+
+            
+
+            return False, orig_target, "Online", 0
+
+
+
+        temp = df.apply(classify_row, axis=1)
+
+        df['Is_Offline'] = temp.apply(lambda x: x[0])
+
+        df['Target_Line'] = temp.apply(lambda x: x[1])
+
+        df['Process_Category'] = temp.apply(lambda x: x[2])
+
+        df['Concurrency_Limit'] = temp.apply(lambda x: x[3])
+
+
+
+        if 'Rush_Col' not in df.columns: df['Rush_Col'] = ''
+
+        df['Is_Rush'] = df['Rush_Col'].astype(str).str.contains('急單', na=False) | df['Remarks'].astype(str).str.contains('急單', na=False)
+
         df['Sequence'] = df['Remarks'].apply(get_sequence)
-        
-        return df, None
-    except Exception as e:
-        return None, str(e)
 
-# 修改後的排程核心
-def run_scheduler(df, total_manpower, total_lines, changeover_mins, line_settings):
+
+
+        return df, engine, None
+
+    except Exception as e: return None, None, str(e)
+
+
+
+# ==========================================
+
+# 4. 報表計算
+
+# ==========================================
+
+def analyze_idle_manpower(timeline, masks, total_mp, max_min):
+
+    global_mask = np.zeros(max_min, dtype=bool)
+
+    for m in masks:
+
+        l = min(len(m), max_min)
+
+        global_mask[:l] |= m[:l]
+
+    records = []
+
+    curr_excess, start_t = -1, -1
+
+    for t in range(max_min):
+
+        if global_mask[t]:
+
+            used = timeline[t]
+
+            excess = total_mp - used
+
+            if excess != curr_excess:
+
+                if curr_excess > 0 and start_t != -1:
+
+                    records.append({'開始時間': format_time_str(start_t), '結束時間': format_time_str(t), '持續分鐘': t-start_t, '閒置(多餘)人力': curr_excess})
+
+                curr_excess, start_t = excess, t
+
+        else:
+
+            if curr_excess > 0 and start_t != -1:
+
+                records.append({'開始時間': format_time_str(start_t), '結束時間': format_time_str(t), '持續分鐘': t-start_t, '閒置(多餘)人力': curr_excess})
+
+            curr_excess, start_t = -1, -1
+
+    return pd.DataFrame(records)
+
+
+
+def calculate_daily_efficiency(timeline, masks, total_mp, results, days):
+
+    recs = []
+
+    for d in range(days):
+
+        s, e = d*1440, (d+1)*1440
+
+        std = np.sum(masks[0][s:e])
+
+        used = np.sum(timeline[s:e])
+
+        cap = total_mp * std
+
+        eff = (used/cap*100) if cap > 0 else 0
+
+        qty = sum(r['數量'] for r in results if r['狀態']=='OK' and s <= r['排序用'] < e)
+
+        sug_mp = math.ceil(used / (std * 0.95)) if std > 0 else 0
+
+        diff = sug_mp - total_mp
+
+        sug_str = f"增 {diff}" if diff > 0 else f"減 {abs(diff)}"
+
+        recs.append({'日期': f'D{d+1}', '當日標準工時(分)': std, '現有人力': total_mp, '建議人力(95%效)': sug_mp, '調度建議': sug_str, '實際產出人時': used, '總產出數': int(qty), '全廠效率(%)': round(eff, 2)})
+
+    return pd.DataFrame(recs)
+
+
+
+def calculate_line_utilization(matrix, masks, lines, days):
+
+    recs = []
+
+    for d in range(days):
+
+        s, e = d*1440, (d+1)*1440
+
+        row = {'日期': f'D{d+1}'}
+
+        for i in range(lines):
+
+            avail = np.sum(masks[i][s:e])
+
+            busy = np.sum(matrix[i][s:e] & masks[i][s:e])
+
+            row[f'Line {i+4} (%)'] = round(busy/avail*100, 1) if avail > 0 else 0
+
+        recs.append(row)
+
+    return pd.DataFrame(recs)
+
+
+
+# ==========================================
+
+# 5. 排程運算區 (Multi-Task Gap Filling + Strict Setup)
+
+# ==========================================
+
+def run_scheduler(df, engine, total_manpower, total_lines, std_changeover, similar_changeover, line_settings, offline_settings):
+
     MAX_MINUTES = 14 * 24 * 60 
+
     
+
     line_masks = []
+
     line_cumsums = []
+
     for setting in line_settings:
+
         m = create_line_mask(setting["start"], setting["end"], 14)
+
         line_masks.append(m)
+
         line_cumsums.append(np.cumsum(m))
-        
-    offline_mask = line_masks[0]
-    offline_cumsum = line_cumsums[0]
+
+    line_free_time = [parse_time_to_mins(setting["start"]) for setting in line_settings]
+
+    line_last_model = {i: None for i in range(total_lines)}
+
+    
+
+    offline_mask = create_line_mask(offline_settings["start"], offline_settings["end"], 14)
+
+    offline_cumsum = np.cumsum(offline_mask)
+
+    offline_resource_usage = {} 
+
+    
 
     timeline_manpower = np.zeros(MAX_MINUTES, dtype=int)
+
     line_usage_matrix = np.zeros((total_lines, MAX_MINUTES), dtype=bool)
+
+    
+
+    order_finish_times = {} 
+
     results = []
-    line_free_time = [parse_time_to_mins(setting["start"]) for setting in line_settings]
+
+
+
+    rush_ids = df[df['Is_Rush']]['Order_ID'].unique()
+
+    df['Order_Is_Rush'] = df['Order_ID'].isin(rush_ids)
+
     
-    # ★★★ 新增：追蹤完工時間字典 (Order_ID, Sequence) -> Finish_Time ★★★
-    order_finish_times = {}
 
-    # --- Phase 1: 流水線 (Online) ---
-    df_online = df[df['Is_Offline'] == False].copy()
-    family_groups = df_online.groupby('Base_Model')
+    # 建立 ID 與分池
+
+    all_tasks = df.to_dict('records')
+
+    for i, t in enumerate(all_tasks): t['Pool_ID'] = i
+
     
-    batches = []
-    for base_model, group_df in family_groups:
-        is_rush = group_df['Is_Rush'].any() 
-        total_weight = (group_df['Manpower_Req'] * 1000 + group_df['Total_Man_Minutes']).sum()
-        target_lines = group_df['Target_Line'].unique()
-        
-        if 4 in target_lines: candidate_lines = [3]
-        elif 5 in target_lines: candidate_lines = [4]
-        else: candidate_lines = [i for i in range(total_lines) if i not in [3, 4]]
-        if not candidate_lines: candidate_lines = [i for i in range(total_lines)] 
 
-        candidate_lines = [c for c in candidate_lines if c < total_lines]
-        if not candidate_lines: candidate_lines = [0]
+    pool_rush = [t for t in all_tasks if t['Order_Is_Rush']]
 
-        batches.append({
-            'base_model': base_model,
-            'df': group_df.sort_values('Priority'),
-            'is_rush': is_rush,
-            'weight': total_weight,
-            'candidate_lines': candidate_lines
-        })
+    pool_fixed = []
+
+    pool_normal = []
+
     
-    batches.sort(key=lambda x: (x['is_rush'], x['weight']), reverse=True)
-    
-    for batch_idx, batch in enumerate(batches):
-        candidate_lines = batch['candidate_lines']
-        batch_df = batch['df']
-        best_line_choice = None 
-        
-        for line_idx in candidate_lines:
-            curr_mask = line_masks[line_idx]
-            curr_cumsum = line_cumsums[line_idx]
-            t_search = line_free_time[line_idx]
-            
-            first_row = batch_df.iloc[0]
-            first_manpower = int(first_row['Manpower_Req'])
-            first_duration = int(np.ceil(first_row['Total_Man_Minutes'] / first_manpower))
-            setup_time = changeover_mins if t_search > 480 else 0
-            
-            total_need = setup_time + first_duration
-            found = False
-            start_t = -1
-            
-            temp_search = t_search
-            while not found and temp_search < MAX_MINUTES - total_need:
-                if not curr_mask[temp_search]:
-                    temp_search += 1
-                    continue
-                
-                s_val = curr_cumsum[temp_search]
-                t_val = s_val + total_need
-                if t_val > curr_cumsum[-1]: break
-                t_end = np.searchsorted(curr_cumsum, t_val)
-                
-                i_mask = curr_mask[temp_search:t_end]
-                max_u = np.max(timeline_manpower[temp_search:t_end][i_mask]) if np.any(i_mask) else 0
-                
-                if max_u + first_manpower <= total_manpower:
-                    start_t = temp_search
-                    found = True
-                else:
-                    temp_search += 5
-            
-            if found:
-                score = start_t
-                if best_line_choice is None or score < best_line_choice[0]:
-                    best_line_choice = (score, line_idx, start_t, setup_time)
-                    
-        if best_line_choice:
-            _, target_line_idx, batch_start_time, initial_setup = best_line_choice
-            current_t = batch_start_time
-            
-            for i, (idx, row) in enumerate(batch_df.iterrows()):
-                manpower = int(row['Manpower_Req'])
-                total_man_minutes = float(row['Total_Man_Minutes'])
-                prod_duration = int(np.ceil(total_man_minutes / manpower)) if manpower > 0 else 0
-                this_setup = initial_setup if i == 0 else 0
-                
-                curr_mask = line_masks[target_line_idx]
-                curr_cumsum = line_cumsums[target_line_idx]
-                total_work = this_setup + prod_duration
-                found_slot = False
-                
-                t_scan = max(current_t, line_free_time[target_line_idx])
-                real_start, real_end = -1, -1
-                
-                while not found_slot and t_scan < MAX_MINUTES - total_work:
-                    if not curr_mask[t_scan]:
-                        t_scan += 1
-                        continue
-                    
-                    s_val = curr_cumsum[t_scan]
-                    t_val = s_val + total_work
-                    if t_val > curr_cumsum[-1]: break
-                    t_end = np.searchsorted(curr_cumsum, t_val)
-                    
-                    i_mask = curr_mask[t_scan:t_end]
-                    max_u = np.max(timeline_manpower[t_scan:t_end][i_mask]) if np.any(i_mask) else 0
-                    
-                    if max_u + manpower <= total_manpower:
-                        real_start, real_end, found_slot = t_scan, t_end, True
-                    else:
-                        t_scan += 5
-                
-                if found_slot:
-                    mask_slice = curr_mask[real_start:real_end]
-                    timeline_manpower[real_start:real_end][mask_slice] += manpower
-                    line_usage_matrix[target_line_idx, real_start:real_end] = True
-                    current_t = real_end
-                    line_free_time[target_line_idx] = real_end 
-                    
-                    # ★★★ 記錄該工單 (Order_ID, Sequence) 的完工時間 ★★★
-                    order_finish_times[(str(row['Order_ID']), row['Sequence'])] = real_end
 
-                    results.append({
-                        '產線': f"Line {target_line_idx+1}", 
-                        '工單': row['Order_ID'], '產品': row['Product_ID'], '備註': row['Remarks'],
-                        '數量': row['Qty'], '類別': '流水線', '換線(分)': this_setup,
-                        '需求人力': manpower, '預計開始': format_time_str(real_start),
-                        '完工時間': format_time_str(real_end), '線佔用(分)': prod_duration, '狀態': 'OK', '排序用': real_end
-                    })
-                else:
-                    results.append({'工單': row['Order_ID'], '狀態': '失敗(資源不足)', '產線': f"Line {target_line_idx+1}"})
+    for t in all_tasks:
 
-    # --- Phase 2: 線外工單 (Offline) ---
-    df_offline = df[df['Is_Offline'] == True].copy()
-    curr_mask = offline_mask
-    curr_cumsum = offline_cumsum
+        if t['Order_Is_Rush']: continue
 
-    for _, row in df_offline.iterrows():
-        manpower = int(row['Manpower_Req'])
-        total_man_minutes = float(row['Total_Man_Minutes'])
-        prod_duration = int(np.ceil(total_man_minutes / manpower)) if manpower > 0 else 0
         
-        if manpower > total_manpower:
-             results.append({'工單': row['Order_ID'], '狀態': '失敗(人力不足)', '產線': '線外專區'})
-             continue
-        
-        # ★★★ Dependency Check: 檢查是否有前置工序 ★★★
-        seq = row['Sequence']
-        order_id = str(row['Order_ID'])
-        min_start_time = 480 # 預設最早 08:00 開始
-        
-        # 如果 Sequence > 1 (例如是標註2)，嘗試尋找 Sequence-1 (標註1) 的完工時間
-        if seq > 1:
-            prev_seq = seq - 1
-            if (order_id, prev_seq) in order_finish_times:
-                min_start_time = order_finish_times[(order_id, prev_seq)]
-                # (選擇性) 可以在這裡加上緩衝時間，目前設定為無縫接軌
-        
-        found = False
-        t_search = max(480, min_start_time) # 搜尋起點必須晚於前置工序完工時間
-        best_start, best_end = -1, -1
 
-        while not found and t_search < MAX_MINUTES - prod_duration:
-            if not curr_mask[t_search]:
-                t_search += 1
-                continue
-            
-            s_val = curr_cumsum[t_search]
-            t_val = s_val + prod_duration
-            if t_val > curr_cumsum[-1]: break
-            t_end = np.searchsorted(curr_cumsum, t_val)
-            
-            i_mask = curr_mask[t_search:t_end]
-            current_max_used = np.max(timeline_manpower[t_search:t_end][i_mask]) if np.any(i_mask) else 0
-            
-            if current_max_used + manpower <= total_manpower:
-                best_start = t_search
-                best_end = t_end
-                found = True
-            else:
-                t_search += 5 
-        
-        if found:
-            mask_slice = curr_mask[best_start:best_end]
-            timeline_manpower[best_start:best_end][mask_slice] += manpower
-            
-            # 記錄完工時間 (以防還有標註3需要等標註2)
-            order_finish_times[(str(row['Order_ID']), row['Sequence'])] = best_end
+        is_fixed = False
 
-            results.append({
-                '產線': '線外專區', 
-                '工單': row['Order_ID'], '產品': row['Product_ID'], '備註': row['Remarks'],
-                '數量': row['Qty'], '類別': '線外', '換線(分)': 0,
-                '需求人力': manpower, '預計開始': format_time_str(best_start),
-                '完工時間': format_time_str(best_end), '線佔用(分)': prod_duration, '狀態': 'OK', '排序用': best_end
-            })
+        if t['Target_Line'] > 0 and (t['Target_Line']-4) in engine.fixed_lines:
+
+            is_fixed = True
+
+        elif t['Target_Line'] == 0:
+
+            bound = engine.get_product_binding(t['Base_Model'])
+
+            if bound is not None and bound in engine.fixed_lines:
+
+                is_fixed = True
+
+        
+
+        if is_fixed: pool_fixed.append(t)
+
+        else: pool_normal.append(t)
+
+
+
+    # 排序
+
+    pool_rush.sort(key=lambda x: (x['Sequence'], x['Priority']))
+
+    pool_fixed.sort(key=lambda x: (x['Target_Line'], x['Sequence'], x['Priority'])) 
+
+    pool_normal.sort(key=lambda x: (x['Sequence'], x['Priority']))
+
+
+
+    # ---------------- 核心函數 ----------------
+
+    def check_line_permission(l_idx, base_model, has_target_line, target_line_val):
+
+        if has_target_line:
+
+            return l_idx == (target_line_val - 4)
+
+        return engine.can_line_accept_product(l_idx, base_model)
+
+
+
+    def get_setup(l_idx, model, start_time):
+
+        if line_last_model[l_idx] is None: return 0
+
+        curr_day = start_time // 1440
+
+        prev_finish = line_free_time[l_idx] 
+
+        if (curr_day > (prev_finish // 1440)): return 0 
+
+        return similar_changeover if line_last_model[l_idx] == model else std_changeover
+
+
+
+    def find_earliest_slot(task, l_idx, min_start_time):
+
+        manpower = int(task['Manpower_Req'])
+
+        prod_duration = int(np.ceil(float(task['Total_Man_Minutes']) / manpower)) if manpower > 0 else 0
+
+        
+
+        if task['Is_Offline']:
+
+            t_search = min_start_time
+
+            mask = offline_mask
+
+            cumsum = offline_cumsum
+
+            res_group = task['Process_Category']
+
+            res_limit = task['Concurrency_Limit']
+
+            if res_group not in offline_resource_usage: 
+
+                offline_resource_usage[res_group] = np.zeros(MAX_MINUTES, dtype=int)
+
         else:
-             results.append({'工單': row['Order_ID'], '狀態': '失敗(找不到空檔)', '產線': '線外專區'})
+
+            t_search = max(line_free_time[l_idx], min_start_time)
+
+            mask = line_masks[l_idx]
+
+            cumsum = line_cumsums[l_idx]
+
+
+
+        while t_search < MAX_MINUTES - prod_duration: 
+
+            if not mask[t_search]:
+
+                t_search += 1
+
+                continue
+
+            
+
+            this_setup = 0
+
+            if not task['Is_Offline']:
+
+                this_setup = get_setup(l_idx, task['Base_Model'], t_search)
+
+            
+
+            total_need = this_setup + prod_duration
+
+            s_val = cumsum[t_search]
+
+            t_val = s_val + total_need
+
+            if t_val > cumsum[-1]: return None
+
+            t_end = np.searchsorted(cumsum, t_val)
+
+            
+
+            if np.any(mask[t_search:t_end]):
+
+                valid_slice = slice(t_search, t_end)
+
+                time_mask = mask[valid_slice]
+
+                curr_mp = timeline_manpower[valid_slice][time_mask]
+
+                max_mp = np.max(curr_mp) if len(curr_mp) > 0 else 0
+
+                
+
+                res_ok = True
+
+                if task['Is_Offline']:
+
+                    curr_res = offline_resource_usage[res_group][valid_slice][time_mask]
+
+                    max_res = np.max(curr_res) if len(curr_res) > 0 else 0
+
+                    if max_res >= res_limit: res_ok = False
+
+                
+
+                if res_ok and (max_mp + manpower <= total_manpower):
+
+                    return t_search, t_end, this_setup, None
+
+                else:
+
+                    t_search += 5 
+
+            else:
+
+                t_search += 5 
+
+        return None
+
+
+
+    def book_slot(task, l_idx, slot_info, log_msg=""):
+
+        start, end, setup, _ = slot_info
+
+        manpower = int(task['Manpower_Req'])
+
+        
+
+        # ★★★ 修正 2: 換線時間顯示 ★★★
+
+        # 排程顯示的開始時間 = 實際上工時間 = Start + Setup
+
+        # 但系統預留時間是從 Start 開始到 End
+
+        # 為了報表正確，預計開始時間應該顯示 Start，並註明包含換線
+
+        # 或者：預計開始 = Start (包含換線)，完工時間 = End
+
+        # 使用者要求：完工時間 11:46, 換線 10 分 -> 下一張預計開始 11:56
+
+        # 所以這裡的 Start 已經是 "包含了換線時間" 的起點嗎？
+
+        # find_earliest_slot 回傳的 `start` 是 "能開始塞入(含換線)的時間點"
+
+        # 所以顯示上：預計開始 = start + setup
+
+        
+
+        display_start = start + setup
+
+        
+
+        if task['Is_Offline']:
+
+            mask_slice = offline_mask[start:end]
+
+            timeline_manpower[start:end][mask_slice] += manpower
+
+            res_group = task['Process_Category']
+
+            offline_resource_usage[res_group][start:end][mask_slice] += 1
+
+            display_line = res_group
+
+        else:
+
+            mask_slice = line_masks[l_idx][start:end]
+
+            timeline_manpower[start:end][mask_slice] += manpower
+
+            line_usage_matrix[l_idx, start:end] = True
+
+            line_free_time[l_idx] = end
+
+            line_last_model[l_idx] = task['Base_Model']
+
+            display_line = f"Line {l_idx+4}"
+
+            
+
+        order_finish_times[(str(task['Order_ID']), task['Sequence'])] = end
+
+        
+
+        results.append({
+
+            '產線': display_line,
+
+            '工單': task['Order_ID'], '產品': task['Product_ID'], 
+
+            '數量': task['Qty'], '類別': '線外' if task['Is_Offline'] else '流水線', 
+
+            '換線(分)': setup, '需求人力': manpower, 
+
+            '預計開始': format_time_str(display_start), # 顯示實際生產開始時間
+
+            '完工時間': format_time_str(end), 
+
+            '線佔用(分)': (end - start), '狀態': 'OK', '排序用': end,
+
+            '備註': task.get('Remarks', ''), '指定線': task.get('Line_Col', ''),
+
+            '急單': 'Yes' if task.get('Order_Is_Rush') else '', '判斷': log_msg
+
+        })
+
+
+
+    def check_dependency(task):
+
+        if task['Sequence'] <= 1: return True, parse_time_to_mins(line_settings[0]["start"])
+
+        prev_key = (str(task['Order_ID']), task['Sequence'] - 1)
+
+        if prev_key in order_finish_times:
+
+            return True, order_finish_times[prev_key]
+
+        return False, 0
+
+
+
+    # ==================================================
+
+    # STEP 1 & 2: 急單優先 + 多工單填補 (Multi-Gap Fill)
+
+    # ==================================================
+
+    while pool_rush:
+
+        task = pool_rush.pop(0)
+
+        is_ready, dep_time = check_dependency(task)
+
+        
+
+        if not is_ready:
+
+            pool_rush.append(task)
+
+            # 安全機制... (省略，與 v23 相同)
+
+            if len(pool_rush) > 0 and all(not check_dependency(t)[0] for t in pool_rush):
+
+                pass
+
+            continue
+
+
+
+        if task['Is_Offline']:
+
+            min_start = max(dep_time, parse_time_to_mins(offline_settings["start"]))
+
+            slot = find_earliest_slot(task, -1, min_start)
+
+            if slot: book_slot(task, -1, slot, "Rush_Offline")
+
+        else:
+
+            t_req = task['Target_Line']
+
+            candidates = [t_req-4] if t_req > 0 else [l for l in range(total_lines) if check_line_permission(l, task['Base_Model'], False, 0)]
+
+            
+
+            best_opt = None
+
+            for l_idx in candidates:
+
+                # ★★★ 修正 1: 多工單填補迴圈 (Multi-Fill) ★★★
+
+                # 只要空隙夠大，就一直填，填到不能填為止
+
+                while True:
+
+                    gap = dep_time - line_free_time[l_idx]
+
+                    if gap <= 30: break # 空隙太小，不填了，直接排急單
+
+                    
+
+                    # 尋找最佳填補者 (Normal Pool)
+
+                    best_filler = None # (idx, task, slot)
+
+                    
+
+                    for n_idx, n_task in enumerate(pool_normal):
+
+                        if n_task['Is_Offline']: continue
+
+                        if not check_line_permission(l_idx, n_task['Base_Model'], False, 0): continue
+
+                        n_ready, n_dep = check_dependency(n_task)
+
+                        if not n_ready: continue
+
+                        
+
+                        # 試算
+
+                        n_start = max(line_free_time[l_idx], n_dep)
+
+                        n_slot = find_earliest_slot(n_task, l_idx, n_start)
+
+                        
+
+                        if n_slot:
+
+                            n_end = n_slot[1]
+
+                            # 允許稍微延後 (10%)
+
+                            if n_end <= dep_time + (gap * 0.1):
+
+                                # 貪婪：找時間最接近 gap (塞最滿) 的單
+
+                                # 或者找最早能開始的單? 這裡選 "塞得最剛好" -> 減少剩餘空隙
+
+                                # 但為了簡單且高效，我們選 "第一張能塞進去的" (First Fit) 
+
+                                # 或者 "耗時最長但小於 gap" 的 (Best Fit)
+
+                                f_dur = n_end - n_start
+
+                                if best_filler is None or f_dur > (best_filler[2][1] - best_filler[2][0]):
+
+                                    best_filler = (n_idx, n_task, n_slot)
+
+                    
+
+                    if best_filler:
+
+                        f_idx, f_task, f_slot = best_filler
+
+                        book_slot(f_task, l_idx, f_slot, "Rush_Multi_Fill")
+
+                        pool_normal.pop(f_idx)
+
+                        # 填補後 line_free_time 推進了，迴圈繼續檢查剩餘 gap
+
+                    else:
+
+                        break # 找不到能填的單了，跳出填補迴圈
+
+
+
+                # 正常排急單 (此時 gap 應該已經被填到最小)
+
+                my_start = max(dep_time, line_free_time[l_idx])
+
+                slot = find_earliest_slot(task, l_idx, my_start)
+
+                if slot:
+
+                    if best_opt is None or slot[1] < best_opt[0]:
+
+                        best_opt = (slot[1], l_idx, slot)
+
+            
+
+            if best_opt:
+
+                book_slot(task, best_opt[1], best_opt[2], "Rush_On")
+
+            else:
+
+                results.append({'工單': task['Order_ID'], '狀態': 'Fail', '備註': '急單資源不足'})
+
+
+
+    # ==================================================
+
+    # STEP 3: 固定線塞滿 (Fixed Line Saturation)
+
+    # ==================================================
+
+    fixed_tasks_map = {} 
+
+    for t in pool_fixed:
+
+        target = -1
+
+        if t['Target_Line'] > 0: target = t['Target_Line'] - 4
+
+        else:
+
+            b = engine.get_product_binding(t['Base_Model'])
+
+            if b is not None: target = b
+
+        
+
+        if target != -1:
+
+            if target not in fixed_tasks_map: fixed_tasks_map[target] = []
+
+            fixed_tasks_map[target].append(t)
+
+            
+
+    for l_idx, tasks in fixed_tasks_map.items():
+
+        tasks.sort(key=lambda x: x['Sequence'])
+
+        for task in tasks:
+
+            is_ready, dep_time = check_dependency(task)
+
+            min_start = max(dep_time, line_free_time[l_idx])
+
+            slot = find_earliest_slot(task, l_idx, min_start)
+
+            if slot: book_slot(task, l_idx, slot, "Fixed_Saturation")
+
+            else: results.append({'工單': task['Order_ID'], '狀態': 'Fail', '備註': '固定線資源不足'})
+
+
+
+    # ==================================================
+
+    # STEP 4: 一般工單貪婪填充 (Normal Greedy)
+
+    # ==================================================
+
+    while pool_normal:
+
+        lines_status = sorted(range(total_lines), key=lambda x: line_free_time[x])
+
+        global_best = None 
+
+        
+
+        for l_idx in lines_status:
+
+            line_ready_time = line_free_time[l_idx]
+
+            if global_best and line_ready_time > global_best[1] + 1440: continue
+
+
+
+            for t_idx, task in enumerate(pool_normal):
+
+                if task['Is_Offline']: continue 
+
+                if not check_line_permission(l_idx, task['Base_Model'], task['Target_Line']>0, task['Target_Line']): continue
+
+                
+
+                is_ready, dep_time = check_dependency(task)
+
+                if not is_ready: continue
+
+                
+
+                start_time = max(line_ready_time, dep_time)
+
+                gap = start_time - line_ready_time
+
+                if gap > 2880: continue 
+
+                
+
+                slot = find_earliest_slot(task, l_idx, start_time)
+
+                if slot:
+
+                    finish = slot[1]
+
+                    setup = slot[2]
+
+                    score = (gap * 100) + finish + (setup * 5)
+
+                    if global_best is None or score < global_best[0]:
+
+                        global_best = (score, finish, l_idx, t_idx, slot)
+
+            
+
+            if global_best and (global_best[4][0] - line_ready_time == 0) and global_best[4][2] == 0:
+
+                break
+
+
+
+        # 線外
+
+        for t_idx, task in enumerate(pool_normal):
+
+            if not task['Is_Offline']: continue
+
+            is_ready, dep_time = check_dependency(task)
+
+            if not is_ready: continue
+
+            
+
+            min_start = max(dep_time, parse_time_to_mins(offline_settings["start"]))
+
+            slot = find_earliest_slot(task, -1, min_start)
+
+            if slot:
+
+                finish = slot[1]
+
+                if global_best is None or slot[0] < global_best[0]: 
+
+                    global_best = (slot[0], finish, -1, t_idx, slot)
+
+
+
+        if global_best:
+
+            _, _, l_idx, t_idx, slot = global_best
+
+            book_slot(pool_normal[t_idx], l_idx, slot, "Normal_Greedy")
+
+            pool_normal.pop(t_idx)
+
+        else:
+
+            if all(not check_dependency(t)[0] for t in pool_normal):
+
+                for t in pool_normal: results.append({'工單': t['Order_ID'], '狀態': 'Fail', '備註': '死鎖'})
+
+                break
+
+            if pool_normal:
+
+                for t in pool_normal: results.append({'工單': t['Order_ID'], '狀態': 'Fail', '備註': '資源不足'})
+
+                break
+
 
 
     if results:
-        last_time = max([r['排序用'] for r in results if r.get('狀態')=='OK'], default=0)
-        analyze_days = (last_time // 1440) + 1
-    else: last_time, analyze_days = 0, 1
+
+        last = max([r['排序用'] for r in results if r.get('狀態')=='OK'], default=0)
+
+        days = (last // 1440) + 1
+
+        df_res = pd.DataFrame(results)
+
+        df_eff = calculate_daily_efficiency(timeline_manpower, line_masks, total_manpower, results, days)
+
+        df_util = calculate_line_utilization(line_usage_matrix, line_masks, total_lines, days)
+
+        df_idle = analyze_idle_manpower(timeline_manpower, line_masks, total_manpower, days*1440)
+
+        return df_res, df_idle, df_eff, df_util
+
         
-    df_idle = analyze_idle_manpower(timeline_manpower, line_masks, total_manpower, last_time + 60)
-    df_efficiency = calculate_daily_efficiency(timeline_manpower, line_masks, total_manpower, analyze_days)
-    df_utilization = calculate_line_utilization(line_usage_matrix, line_masks, total_lines, analyze_days)
-    return pd.DataFrame(results), df_idle, df_efficiency, df_utilization
+
+    return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+
+
 
 # ==========================================
-# 2. Streamlit 網頁介面設計
+
+# 6. UI
+
 # ==========================================
 
 st.set_page_config(page_title="AI 智能排程系統", layout="wide")
 
-st.title(f"🏭 {SYSTEM_VERSION} - 線上排程平台")
-st.markdown("上傳 Excel 工單，AI 自動幫您規劃產線與人力配置。")
+st.title(f"🏭 {SYSTEM_VERSION}")
+
+
 
 with st.sidebar:
+
     st.header("⚙️ 全域參數")
-    total_manpower = st.number_input("全廠總人力 (人)", min_value=1, value=50)
-    total_lines = st.number_input("產線數量 (條)", min_value=1, value=5)
-    changeover_mins = st.number_input("換線時間 (分)", min_value=0, value=30)
+
+    total_manpower = st.number_input("全廠總人力", value=50)
+
+    total_lines = st.number_input("產線數量", value=5)
+
+    c1, c2 = st.columns(2)
+
+    std_changeover = c1.number_input("標準換線", value=10)
+
+    sim_changeover = c2.number_input("相似換線", value=5)
+
     
-    st.markdown("---")
-    st.header("🕒 各產線工時設定")
-    
-    line_settings_from_ui = []
-    with st.expander("點此展開設定詳細時間", expanded=True):
+
+    line_settings = []
+
+    with st.expander("產線時間", expanded=True):
+
         for i in range(total_lines):
-            st.markdown(f"**Line {i+1}**")
-            col1, col2 = st.columns(2)
-            with col1:
-                t_start = st.time_input(f"L{i+1} 開始", value=time(8, 0), key=f"start_{i}")
-            with col2:
-                t_end = st.time_input(f"L{i+1} 結束", value=time(17, 0), key=f"end_{i}")
-            
-            line_settings_from_ui.append({
-                "start": t_start.strftime("%H:%M"), 
-                "end": t_end.strftime("%H:%M")
-            })
 
-    st.markdown("---")
-    st.info("💡 說明：\n1. 系統會將相同主型號工單合併生產。\n2. 若備註欄有標註順序 (如 1, 2)，系統會確保標註 2 在標註 1 完工後才開始。")
+            c1, c2 = st.columns(2)
 
-uploaded_file = st.file_uploader("📂 請上傳工單 Excel 檔案", type=["xlsx", "xls"])
+            s = c1.time_input(f"L{i+4}起", time(8,0), key=f"s{i}")
 
-if uploaded_file is not None:
-    df_clean, err = load_and_clean_data(uploaded_file)
+            e = c2.time_input(f"L{i+4}迄", time(17,0), key=f"e{i}")
+
+            line_settings.append({"start": s.strftime("%H:%M"), "end": e.strftime("%H:%M")})
+
     
-    if err:
-        st.error(f"讀取失敗: {err}")
-    else:
-        st.success(f"讀取成功！共 {len(df_clean)} 筆有效工單。")
-        with st.expander("查看原始資料預覽"):
-            st.dataframe(df_clean.head())
-            
-        if st.button("🚀 開始 AI 排程運算", type="primary"):
-            with st.spinner('正在進行百萬次模擬運算 (包含工序相依性檢查)...請稍候...'):
-                df_schedule, df_idle, df_efficiency, df_utilization = run_scheduler(
-                    df_clean, 
-                    total_manpower, 
-                    total_lines, 
-                    changeover_mins, 
-                    line_settings_from_ui
-                )
-                
-                st.success("✅ 排程運算完成！")
-                
-                output = io.BytesIO()
-                with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-                    df_schedule.to_excel(writer, sheet_name='生產排程', index=False)
-                    df_efficiency.to_excel(writer, sheet_name='每日效率分析', index=False)
-                    df_utilization.to_excel(writer, sheet_name='各線稼動率', index=False)
-                    df_idle.to_excel(writer, sheet_name='閒置人力明細', index=False)
-                output.seek(0)
-                
-                st.download_button(
-                    label="📥 下載完整排程報表 (Excel)",
-                    data=output,
-                    file_name=f'AI_Schedule_{datetime.now().strftime("%Y%m%d_%H%M")}.xlsx',
-                    mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
-                )
-                
-                tab1, tab2, tab3 = st.tabs(["📊 生產排程表", "📈 效率分析", "⚠️ 閒置人力"])
-                
-                with tab1:
-                    st.dataframe(df_schedule, use_container_width=True)
-                
-                with tab2:
-                    col1, col2 = st.columns(2)
-                    with col1:
-                        st.subheader("每日效率")
-                        st.dataframe(df_efficiency)
-                    with col2:
-                        st.subheader("產線稼動率")
-                        st.dataframe(df_utilization)
-                        
-                with tab3:
-                    st.dataframe(df_idle, use_container_width=True)
 
-else:
-    st.info("👈 請從左側開始設定參數，再上傳檔案。")
+    c1, c2 = st.columns(2)
+
+    os = c1.time_input("線外起", time(8,0))
+
+    oe = c2.time_input("線外迄", time(17,0))
+
+    offline_settings = {"start": os.strftime("%H:%M"), "end": oe.strftime("%H:%M")}
+
+
+
+f = st.file_uploader("上傳 Excel (含工單與規則)", type=['xlsx'])
+
+if f:
+
+    df, engine, err = load_and_clean_data(f)
+
+    if err: st.error(err)
+
+    else:
+
+        with st.expander("規則檢視"):
+
+            st.write("Fixed:", engine.fixed_lines)
+
+            st.write("Product Binding:", engine.product_binding)
+
+            
+
+        if st.button("Run"):
+
+            res, idle, eff, util = run_scheduler(df, engine, total_manpower, total_lines, std_changeover, sim_changeover, line_settings, offline_settings)
+
+            
+
+            t1, t2, t3, t4 = st.tabs(["排程表", "效率", "稼動", "閒置"])
+
+            with t1: st.dataframe(res, use_container_width=True)
+
+            with t2: st.dataframe(eff, use_container_width=True)
+
+            with t3: st.dataframe(util, use_container_width=True)
+
+            with t4: st.dataframe(idle, use_container_width=True)
+
+
+
+            out = io.BytesIO()
+
+            with pd.ExcelWriter(out, engine='xlsxwriter') as writer:
+
+                res.to_excel(writer, sheet_name="排程", index=False)
+
+                eff.to_excel(writer, sheet_name="效率", index=False)
+
+                util.to_excel(writer, sheet_name="稼動", index=False)
+
+                idle.to_excel(writer, sheet_name="閒置", index=False)
+
+            out.seek(0)
+
+            st.download_button("下載報表", out, "Schedule_v23.1.xlsx")
